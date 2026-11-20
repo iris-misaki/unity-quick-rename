@@ -7,6 +7,10 @@
 纯 C#，无第三方 DLL，无运行时依赖（`Editor` 目录会自动识别为编辑器脚本）。
 
 ---
+### 📸 效果展示
+<img width="559" height="565" alt="image" src="https://github.com/user-attachments/assets/0e60d917-ee50-492f-ad10-bd1e6e2c94e4" />
+
+
 
 ## 一、安装
 
