@@ -16,7 +16,7 @@ namespace LevelNameTranslator
     /// </summary>
     public class LevelNameTranslatorWindow : EditorWindow
     {
-        private const string Version = "1.0.0";
+        private const string Version = "1.0.1";
         private const string MenuPath = "Tools/层级名翻译器";
         private const string MenuPathEnglish = "Tools/Level Name Translator (层级名翻译器)";
 
@@ -34,21 +34,12 @@ namespace LevelNameTranslator
             public int StatusKind;
         }
 
-        [Serializable]
-        private class UndoRecord
-        {
-            public GameObject Target;
-            public string OldName;
-        }
-
         [SerializeField] private List<Entry> entries = new List<Entry>();
-        [SerializeField] private List<UndoRecord> undoRecords = new List<UndoRecord>();
         [SerializeField] private string logText = string.Empty;
         [SerializeField] private bool settingsExpanded;
+        [SerializeField] private bool syncAnimationBindings;
 
         private TranslatorSettings settings;
-        private List<SafetyFinding> lastFindings;
-        private bool safetyCheckStale = true;
         private bool busy;
 
         private ScrollView listContainer;
@@ -68,7 +59,6 @@ namespace LevelNameTranslator
         private Button glossaryButton;
         private Button checkButton;
         private Button applyButton;
-        private Button revertButton;
 
         // ------------------------------------------------------------------ 生命周期
 
@@ -93,10 +83,6 @@ namespace LevelNameTranslator
                 entries = new List<Entry>();
             }
 
-            if (undoRecords == null)
-            {
-                undoRecords = new List<UndoRecord>();
-            }
         }
 
         public void CreateGUI()
@@ -335,10 +321,6 @@ namespace LevelNameTranslator
             applyButton.style.marginLeft = 4;
             row2.Add(applyButton);
 
-            revertButton = new Button(RevertRename) { text = "撤销改名" };
-            revertButton.style.flexGrow = 1;
-            revertButton.style.marginLeft = 4;
-            row2.Add(revertButton);
 
             rootVisualElement.Add(row2);
 
@@ -358,6 +340,25 @@ namespace LevelNameTranslator
             row3.Add(countLabel);
 
             rootVisualElement.Add(row3);
+
+            var animRow = new VisualElement();
+            animRow.style.flexDirection = FlexDirection.Row;
+            animRow.style.marginBottom = 4;
+
+            var animToggle = new Toggle("改名后同步修正动画路径（.anim）");
+            animToggle.value = syncAnimationBindings;
+            animToggle.style.flexGrow = 1;
+            animToggle.tooltip =
+                "打开后，由 Unity 同步更新已确认的动画曲线。\n" +
+                "应用前会列出拟修改的动画；可用 Ctrl+Z 一起撤销。";
+            animToggle.RegisterValueChangedCallback(evt =>
+            {
+                syncAnimationBindings = evt.newValue;
+                UpdateToolbarState();
+            });
+            animRow.Add(animToggle);
+
+            rootVisualElement.Add(animRow);
         }
 
         private void BuildList()
@@ -490,7 +491,6 @@ namespace LevelNameTranslator
                 added++;
             }
 
-            safetyCheckStale = true;
             RebuildList();
             UpdateToolbarState();
 
@@ -544,8 +544,6 @@ namespace LevelNameTranslator
         private void ClearEntries()
         {
             entries.Clear();
-            lastFindings = null;
-            safetyCheckStale = true;
             RebuildList();
             UpdateToolbarState();
         }
@@ -672,7 +670,6 @@ namespace LevelNameTranslator
             var remove = new Button(() =>
             {
                 entries.Remove(captured);
-                safetyCheckStale = true;
                 RebuildList();
                 UpdateToolbarState();
             });
@@ -696,7 +693,6 @@ namespace LevelNameTranslator
             glossaryButton.SetEnabled(hasEntries && !busy);
             checkButton.SetEnabled(hasEntries && !busy);
             applyButton.SetEnabled(hasEntries && !busy);
-            revertButton.SetEnabled(hasEntries && undoRecords.Count > 0 && !busy);
 
             var caption = new StringBuilder("开始翻译");
             if (hasEntries)
@@ -994,13 +990,6 @@ namespace LevelNameTranslator
             List<SafetyFinding> findings = RenameSafetyChecker.Check(targets, out canceled);
 
             busy = false;
-            lastFindings = findings;
-
-            // 取消了就不能算检查过，否则后面会拿着半份结果去改名。
-            if (!canceled)
-            {
-                safetyCheckStale = false;
-            }
 
             UpdateToolbarState();
 
@@ -1015,320 +1004,122 @@ namespace LevelNameTranslator
 
         private void ReportFindings(List<SafetyFinding> findings, bool showDialog)
         {
-            int danger = 0;
-            int warning = 0;
-            int info = 0;
-            StringBuilder details = new StringBuilder();
-
-            for (int i = 0; i < findings.Count; i++)
+            var lines = new StringBuilder();
+            int count = 0;
+            foreach (var finding in findings)
             {
-                SafetyFinding finding = findings[i];
-                switch (finding.Level)
-                {
-                    case FindingLevel.Danger: danger++; break;
-                    case FindingLevel.Warning: warning++; break;
-                    default: info++; break;
-                }
-
-                if (details.Length < 6000)
-                {
-                    details.AppendLine("  " + finding.Describe());
-                }
+                if (finding.Level == FindingLevel.Info) continue;
+                count++;
+                if (lines.Length < 6500) lines.AppendLine(finding.Describe());
             }
-
-            if (findings.Count == 0)
-            {
-                Log("安全预检通过：没有发现按名字或路径引用这些对象的地方。");
-            }
-            else
-            {
-                Log("安全预检完成：危险 " + danger + " 条，注意 " + warning + " 条，提示 " + info + " 条。");
-                Log(details.ToString().TrimEnd());
-            }
-
-            if (!showDialog)
-            {
-                return;
-            }
-
-            if (danger > 0)
-            {
-                EditorUtility.DisplayDialog(
-                    "安全预检：发现危险引用",
-                    "有 " + danger + " 处是按名字/路径引用这些对象的：\n\n" +
-                    "动画剪辑会找不到对象，代码里的 Find(...) 会失效。\n\n" +
-                    "详细清单已经写到下面日志里。\n" +
-                    "如果这些引用确实存在，改名前请先想清楚；确认要改就点「应用改名」，会再问一次。",
-                    "知道了");
-            }
-            else if (warning > 0)
-            {
-                EditorUtility.DisplayDialog(
-                    "安全预检：有需要注意的地方",
-                    "有 " + warning + " 处序列化路径字段可能引用这些对象（比如 MA / 换装组件的路径配置）。\n\n" +
-                    "详细清单在下面日志里。这些不一定会坏，但建议看一眼。",
-                    "知道了");
-            }
+            string summary = "文本预检：发现 " + count + " 条可能的引用。文本匹配不代表已经确认动画绑定；未发现也不代表没有其他引用。";
+            Log(summary);
+            if (lines.Length > 0) Log(lines.ToString());
+            if (showDialog) EditorUtility.DisplayDialog("安全预检", summary + "\n详情见日志。点击应用时会重新计算动画修改清单。", "知道了");
         }
-
-        // ------------------------------------------------------------------ 应用改名
 
         private void ApplyRename()
         {
-            if (busy)
+            if (busy || EditorApplication.isPlayingOrWillChangePlaymode || AnimationMode.InAnimationMode())
             {
+                Log("请退出播放模式和动画预览，再应用改名。");
                 return;
             }
 
-            var ready = new List<Entry>();
-            for (int i = 0; i < entries.Count; i++)
+            var names = new Dictionary<Transform, string>();
+            foreach (var entry in entries)
             {
-                Entry entry = entries[i];
-                if (entry == null || entry.Target == null)
+                if (entry?.Target == null) continue;
+                string name = (entry.NewName ?? string.Empty).Trim();
+                if (name.Length == 0 || name == entry.Target.name) continue;
+                if (name.Contains("/") || Array.Exists(name.ToCharArray(), char.IsControl) ||
+                    EditorUtility.IsPersistent(entry.Target) || !entry.Target.scene.IsValid())
                 {
-                    continue;
-                }
-
-                string newName = (entry.NewName ?? string.Empty).Trim();
-                if (newName.Length == 0)
-                {
-                    continue;
-                }
-
-                if (newName == entry.Target.name)
-                {
-                    continue;
-                }
-
-                entry.NewName = newName;
-                ready.Add(entry);
-            }
-
-            if (ready.Count == 0)
-            {
-                Log("没有需要改名的条目。译文为空或和原名一样。");
-                return;
-            }
-
-            if (safetyCheckStale && !RunSafetyCheckBeforeApply())
-            {
-                Log("安全预检被取消，已停止应用。要改名请重新点「安全预检」并等它跑完。");
-                return;
-            }
-
-            int danger = 0;
-            if (lastFindings != null)
-            {
-                for (int i = 0; i < lastFindings.Count; i++)
-                {
-                    if (lastFindings[i].Level == FindingLevel.Danger)
-                    {
-                        danger++;
-                    }
-                }
-            }
-
-            if (danger > 0)
-            {
-                bool proceed = EditorUtility.DisplayDialog(
-                    "仍然要改名吗？",
-                    "安全预检发现了 " + danger + " 处危险引用（动画路径或代码 Find）。\n\n" +
-                    "改名后这些地方会失效。\n\n" +
-                    "确定要继续的话点「继续改名」，否则点「取消」。",
-                    "继续改名",
-                    "取消");
-
-                if (!proceed)
-                {
-                    Log("已取消应用。");
+                    Log("已停止：请使用 Hierarchy 或 Prefab 模式中的对象，名称不能包含斜杠或控制字符：" + entry.Target.name);
                     return;
                 }
+                names.Add(entry.Target.transform, name);
+            }
+            if (names.Count == 0) { Log("没有需要修改的名称。"); return; }
+
+            foreach (var item in names)
+            {
+                var t = item.Key;
+                int count = t.parent == null ? t.gameObject.scene.rootCount : t.parent.childCount;
+                var sceneRoots = t.parent == null ? t.gameObject.scene.GetRootGameObjects() : null;
+                for (int i = 0; i < count; i++)
+                {
+                    var other = t.parent == null ? sceneRoots[i].transform : t.parent.GetChild(i);
+                    if (other != t && (names.TryGetValue(other, out var newName) ? newName : other.name) == item.Value)
+                    { Log("已停止：同级节点改名后重名：" + item.Value); return; }
+                }
             }
 
-            int applied = 0;
-            int assetTouched = 0;
-            StringBuilder report = new StringBuilder();
-
-            undoRecords.Clear();
-
-            for (int i = 0; i < ready.Count; i++)
+            AnimationPathFixer.Plan plan;
+            List<SafetyFinding> findings;
+            try
             {
-                Entry entry = ready[i];
-                GameObject go = entry.Target;
+                var targets = new List<GameObject>();
+                foreach (var item in names) targets.Add(item.Key.gameObject);
+                findings = RenameSafetyChecker.Check(targets, out bool canceled);
+                if (canceled) { Log("预检已取消，未修改任何内容。"); return; }
+                plan = syncAnimationBindings ? AnimationPathFixer.Build(names) : new AnimationPathFixer.Plan();
+            }
+            catch (Exception e) { Log("预检失败，未修改任何内容：" + e.Message); return; }
+            ReportFindings(findings, false);
+            if (plan.Issues.Count > 0)
+            {
+                Log("已停止，没有改名或修改动画：\n" + string.Join("\n", plan.Issues));
+                EditorUtility.DisplayDialog("无法可靠更新动画", "所选对象的动画中存在无法安全更新的绑定。没有写入任何内容，请查看日志。", "知道了");
+                return;
+            }
+            var editedPaths = new HashSet<string>(StringComparer.Ordinal);
+            var preview = new StringBuilder();
+            foreach (var clip in plan.Edits)
+            {
+                string path = AssetDatabase.GetAssetPath(clip.Clip);
+                editedPaths.Add(path);
+                Log("计划更新：" + path + "（" + clip.Curves.Count + " 条曲线）");
+                if (preview.Length < 800) preview.AppendLine(path);
+            }
+            int unresolved = 0;
+            foreach (var f in findings)
+                if (f.Level != FindingLevel.Info && (!f.FixableByPathRewrite ||
+                    !editedPaths.Contains("Assets/" + (f.File ?? "").Replace('\\', '/')))) unresolved++;
+            if (!EditorUtility.DisplayDialog("确认改名和动画更新",
+                "改名 " + names.Count + " 项；更新 " + plan.Edits.Count + " 个剪辑。\n" + preview +
+                "\n未纳入本次更新的潜在引用：" + unresolved + " 条。代码、第三方路径、未加载的模型或其他共用者不会自动修复；有疑问请取消并查看日志。\n建议先备份工程。",
+                unresolved == 0 ? "应用" : "仍然应用", "取消")) return;
 
-                if (go == null)
+            Undo.IncrementCurrentGroup();
+            int group = Undo.GetCurrentGroup();
+            Undo.SetCurrentGroupName("层级名翻译（含动画）");
+            try
+            {
+                foreach (var item in names)
                 {
-                    continue;
-                }
-
-                string oldName = go.name;
-                string newName = entry.NewName;
-
-                if (oldName == newName)
-                {
-                    continue;
-                }
-
-                undoRecords.Add(new UndoRecord { Target = go, OldName = oldName });
-
-                Undo.RecordObject(go, "层级名翻译");
-                go.name = newName;
-
-                bool isPrefabAsset = PrefabUtility.IsPartOfPrefabAsset(go) &&
-                                     !PrefabUtility.IsPartOfPrefabInstance(go);
-
-                if (PrefabUtility.IsPartOfPrefabInstance(go))
-                {
-                    PrefabUtility.RecordPrefabInstancePropertyModifications(go);
-                }
-                else
-                {
-                    EditorUtility.SetDirty(go);
-
-                    if (isPrefabAsset)
-                    {
-                        assetTouched++;
-                    }
-                }
-
-                if (go.scene.IsValid())
-                {
+                    var go = item.Key.gameObject;
+                    Undo.RegisterCompleteObjectUndo(go, "层级名翻译（含动画）");
+                    go.name = item.Value;
+                    if (PrefabUtility.IsPartOfPrefabInstance(go)) PrefabUtility.RecordPrefabInstancePropertyModifications(go);
                     EditorSceneManager.MarkSceneDirty(go.scene);
                 }
-
-                entry.OriginalName = oldName;
-                entry.StatusText = "已改名";
-                entry.StatusKind = ColorOk;
-
-                applied++;
-                report.AppendLine("  " + oldName + " → " + newName);
+                foreach (var edit in plan.Edits) AnimationPathFixer.Apply(edit);
+                Undo.CollapseUndoOperations(group);
+                Undo.IncrementCurrentGroup();
             }
-
-            if (applied == 0)
+            catch (Exception e)
             {
-                Log("实际没有改动。");
+                Undo.RevertAllDownToGroup(group);
+                Log("应用失败，已回滚本批次：" + e.Message);
                 return;
             }
-
-            if (assetTouched > 0)
-            {
-                AssetDatabase.SaveAssets();
-            }
-
-            safetyCheckStale = true;
+            Log("已改名 " + names.Count + " 项，更新 " + plan.Edits.Count + " 个动画剪辑。检查动画后请保存场景或 Prefab，并用 File → Save Project 保存动画资产。需要撤销时用 Edit → Undo（Ctrl+Z），会一起撤销本批对象和动画；保存过则撤销后再保存。");
+            foreach (var entry in entries)
+                if (entry?.Target != null && names.ContainsKey(entry.Target.transform))
+                { entry.StatusText = "已改名"; entry.StatusKind = ColorOk; }
             RebuildList();
             UpdateToolbarState();
-
-            Log("已应用 " + applied + " 项改名：");
-            Log(report.ToString().TrimEnd());
-
-            if (assetTouched > 0)
-            {
-                Log("其中 " + assetTouched + " 项属于 Prefab 资源，已经保存到磁盘。");
-            }
-
-            Log("场景里的改名需要按 Ctrl+S 保存。改错了点「撤销改名」可以还原（Ctrl+Z 也能撤）。");
-        }
-
-        private bool RunSafetyCheckBeforeApply()
-        {
-            var targets = new List<GameObject>();
-            for (int i = 0; i < entries.Count; i++)
-            {
-                if (entries[i] != null && entries[i].Target != null)
-                {
-                    targets.Add(entries[i].Target);
-                }
-            }
-
-            if (targets.Count == 0)
-            {
-                lastFindings = new List<SafetyFinding>();
-                safetyCheckStale = false;
-                return true;
-            }
-
-            bool canceled;
-            lastFindings = RenameSafetyChecker.Check(targets, out canceled);
-
-            if (canceled)
-            {
-                return false;
-            }
-
-            safetyCheckStale = false;
-            ReportFindings(lastFindings, false);
-            return true;
-        }
-
-        private void RevertRename()
-        {
-            if (busy)
-            {
-                return;
-            }
-
-            if (undoRecords.Count == 0)
-            {
-                Log("没有可撤销的记录。只有用「应用改名」改过的才记录在这里。");
-                return;
-            }
-
-            int reverted = 0;
-            StringBuilder report = new StringBuilder();
-
-            for (int i = undoRecords.Count - 1; i >= 0; i--)
-            {
-                UndoRecord record = undoRecords[i];
-                if (record == null || record.Target == null)
-                {
-                    continue;
-                }
-
-                string currentName = record.Target.name;
-
-                Undo.RecordObject(record.Target, "撤销层级名翻译");
-                record.Target.name = record.OldName;
-
-                if (PrefabUtility.IsPartOfPrefabInstance(record.Target))
-                {
-                    PrefabUtility.RecordPrefabInstancePropertyModifications(record.Target);
-                }
-                else
-                {
-                    EditorUtility.SetDirty(record.Target);
-                }
-
-                if (record.Target.scene.IsValid())
-                {
-                    EditorSceneManager.MarkSceneDirty(record.Target.scene);
-                }
-
-                report.AppendLine("  " + currentName + " → " + record.OldName);
-                reverted++;
-            }
-
-            undoRecords.Clear();
-            AssetDatabase.SaveAssets();
-            safetyCheckStale = true;
-
-            for (int i = 0; i < entries.Count; i++)
-            {
-                Entry entry = entries[i];
-                if (entry != null && entry.Target != null)
-                {
-                    entry.OriginalName = entry.Target.name;
-                    entry.NewName = string.Empty;
-                    entry.StatusText = "待翻译";
-                    entry.StatusKind = ColorOk;
-                }
-            }
-
-            RebuildList();
-            UpdateToolbarState();
-
-            Log("已撤销 " + reverted + " 项改名：");
-            Log(report.ToString().TrimEnd());
         }
 
         // ------------------------------------------------------------------ 导出

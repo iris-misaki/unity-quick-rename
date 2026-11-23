@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -23,6 +24,9 @@ namespace LevelNameTranslator
         public string File;
         public int Line;
 
+        /// <summary>true 表示这条危险可以通过「自动修正动画路径」消除。</summary>
+        public bool FixableByPathRewrite;
+
         public string Describe()
         {
             var sb = new StringBuilder();
@@ -34,7 +38,14 @@ namespace LevelNameTranslator
                 default: sb.Append("[提示] "); break;
             }
 
-            sb.Append(TargetName).Append(" — ").Append(Message);
+            sb.Append(TargetName).Append(" — ");
+
+            if (FixableByPathRewrite)
+            {
+                sb.Append("[动画路径候选，需确认] ");
+            }
+
+            sb.Append(Message);
 
             if (!string.IsNullOrEmpty(File))
             {
@@ -107,6 +118,9 @@ namespace LevelNameTranslator
                 return findings;
             }
 
+            // YAML 会把非 ASCII 名字转义成 \uXXXX，所以额外准备一份转义形态用于匹配。
+            Dictionary<string, string> escapedSet = BuildEscapedForms(nameSet);
+
             AddAnimatorContextFindings(targets, findings);
 
             string assetsRoot = Application.dataPath;
@@ -162,7 +176,8 @@ namespace LevelNameTranslator
                     }
 
                     // 廉价预筛：文件里一个待检查名字都没有就整份跳过。
-                    if (!ContainsAny(text, nameSet))
+                    // 注意：YAML 里非 ASCII 名字会写成 \uXXXX 转义，所以两种形式都要试。
+                    if (!ContainsAny(text, nameSet, escapedSet))
                     {
                         continue;
                     }
@@ -238,7 +253,10 @@ namespace LevelNameTranslator
             return files;
         }
 
-        private static bool ContainsAny(string text, Dictionary<string, string> nameSet)
+        private static bool ContainsAny(
+            string text,
+            Dictionary<string, string> nameSet,
+            Dictionary<string, string> escapedSet)
         {
             foreach (var pair in nameSet)
             {
@@ -248,7 +266,100 @@ namespace LevelNameTranslator
                 }
             }
 
+            if (escapedSet != null)
+            {
+                foreach (var pair in escapedSet)
+                {
+                    if (text.IndexOf(pair.Key, StringComparison.Ordinal) >= 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+
             return false;
+        }
+
+        /// <summary>把名字转成 Unity YAML 里可能出现的形式（非 ASCII → \uXXXX，大写十六进制）。</summary>
+        private static Dictionary<string, string> BuildEscapedForms(Dictionary<string, string> nameSet)
+        {
+            var result = new Dictionary<string, string>(StringComparer.Ordinal);
+
+            foreach (var pair in nameSet)
+            {
+                string escaped = EscapeYamlName(pair.Key);
+                if (!string.Equals(escaped, pair.Key, StringComparison.Ordinal))
+                {
+                    result[escaped] = pair.Key;
+                }
+            }
+
+            return result;
+        }
+
+        private static string EscapeYamlName(string name)
+        {
+            var sb = new StringBuilder(name.Length + 8);
+
+            for (int i = 0; i < name.Length; i++)
+            {
+                char c = name[i];
+
+                if (c > 127)
+                {
+                    sb.Append("\\u").Append(((int)c).ToString("X4", CultureInfo.InvariantCulture));
+                }
+                else
+                {
+                    sb.Append(c);
+                }
+            }
+
+            return sb.ToString();
+        }
+
+        /// <summary>把 YAML 字符串里的 \uXXXX 等转义还原成真实字符。</summary>
+        private static string UnescapeYamlString(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value.IndexOf('\\') < 0)
+            {
+                return value;
+            }
+
+            var sb = new StringBuilder(value.Length);
+
+            for (int i = 0; i < value.Length; i++)
+            {
+                char c = value[i];
+
+                if (c == '\\' && i + 1 < value.Length)
+                {
+                    char next = value[i + 1];
+
+                    if ((next == 'u' || next == 'U') && i + 5 < value.Length)
+                    {
+                        int code;
+                        if (int.TryParse(
+                                value.Substring(i + 2, 4),
+                                NumberStyles.HexNumber,
+                                CultureInfo.InvariantCulture,
+                                out code))
+                        {
+                            sb.Append((char)code);
+                            i += 5;
+                            continue;
+                        }
+                    }
+                    else if (next == 'n') { sb.Append('\n'); i++; continue; }
+                    else if (next == 't') { sb.Append('\t'); i++; continue; }
+                    else if (next == '"') { sb.Append('"'); i++; continue; }
+                    else if (next == '\\') { sb.Append('\\'); i++; continue; }
+                }
+
+                sb.Append(c);
+            }
+
+            return sb.ToString();
         }
 
         // ------------------------------------------------------------ 动画
@@ -265,6 +376,10 @@ namespace LevelNameTranslator
             for (int i = 0; i < matches.Count; i++)
             {
                 string rawPath = matches[i].Groups[1].Value.Trim().Trim('"', '\'');
+
+                // YAML 里非 ASCII 名字是 \uXXXX 转义，先还原再按 / 拆段比较
+                rawPath = UnescapeYamlString(rawPath);
+
                 if (rawPath.Length == 0)
                 {
                     continue;
@@ -293,7 +408,8 @@ namespace LevelNameTranslator
                         TargetName = segment,
                         Message = "这个动画片段按层级路径绑定它（路径：" + rawPath + "），改名后动画会找不到对象",
                         File = relative,
-                        Line = line
+                        Line = line,
+                        FixableByPathRewrite = true
                     });
                 }
             }
@@ -356,7 +472,13 @@ namespace LevelNameTranslator
 
             for (int index = 0; index < lines.Length; index++)
             {
+                // YAML 里非 ASCII 名字是 \uXXXX 转义，还原后再匹配
                 string line = lines[index];
+                if (line.IndexOf('\\') >= 0)
+                {
+                    line = UnescapeYamlString(line);
+                }
+
                 if (line.Length == 0 || line.Length > 2000)
                 {
                     continue;
